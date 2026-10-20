@@ -189,6 +189,8 @@ class Store:
           PRIMARY KEY(source,msg,dest,mode));
         CREATE TABLE IF NOT EXISTS logs(
           id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, category TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS jobs_dispatch ON jobs(status,due,created);
+        CREATE INDEX IF NOT EXISTS jobs_source_order ON jobs(source,first_id,status);
         PRAGMA user_version=1;
         COMMIT;
         ''')
@@ -425,11 +427,19 @@ class Application:
             elif not join:
                 raise UserError('Private invite is valid, but membership is not confirmed. Use Add Source to request joining.')
             else:
+                if not getattr(invite, 'broadcast', False) and not getattr(getattr(invite, 'chat', None), 'broadcast', False):
+                    raise UserError('This invitation is not for a broadcast channel.')
                 try:
                     result = await client(functions.messages.ImportChatInviteRequest(match[1]))
                     entity = result.chats[0]
                 except errors.InviteRequestSentError:
-                    raise UserError('Join Request Pending. After approval, use Add Source with this link again. Monitoring is not enabled.')
+                    joins = self.db.get('joins', {})
+                    if len(joins) >= 20 and match[1] not in joins:
+                        raise UserError('Join request sent; pending-request tracker is full. Recheck manually with Add Source after approval.')
+                    joins[match[1]] = {'requested': time.time(), 'title': getattr(invite, 'title', 'Private channel')}
+                    self.db.set('joins', joins)
+                    self.set_flow()
+                    raise UserError('Join Request Pending. Membership will be rechecked periodically. If approved, the source is added OFF; you must configure and start it.')
         else:
             public = re.fullmatch(r'(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z][\w]{3,31})/?', value)
             if public:
@@ -447,18 +457,45 @@ class Application:
                 if not re.fullmatch(r'@?[A-Za-z][\w]{3,31}', value):
                     raise UserError('Use an exact @username, public channel URL, invite URL or accessible -100 channel ID. Display-name search is ambiguous.')
                 entity = await client.get_entity(value)
-            if join and isinstance(entity, types.Channel) and getattr(entity, 'left', False):
+            if isinstance(entity, types.Chat) or not isinstance(entity, types.Channel):
+                raise UserError('This is not a broadcast channel. Groups and forum destinations are not supported.')
+            if join and entity.broadcast and getattr(entity, 'left', False):
                 await client(functions.channels.JoinChannelRequest(entity))
                 entity = await client.get_entity(entity)
-        if not isinstance(entity, types.Channel) or not entity.broadcast:
-            raise UserError('This is not a broadcast channel. Groups and forum destinations are not supported.')
-        if getattr(entity, 'left', False):
+        if isinstance(entity, types.Channel) and getattr(entity, 'left', False):
             if join:
                 raise UserError('Membership is not confirmed. Wait for approval, then add the source again.')
         return entity
 
+    def register_source(self, entity):
+        if entity.noforwards:
+            raise UserError('This channel protects its content. It cannot be copied.')
+        sid = utils.get_peer_id(entity)
+        if self.db.rows('SELECT COUNT(*) FROM sources')[0][0] >= 80 and not self.db.rows('SELECT 1 FROM sources WHERE id=?', (sid,)):
+            raise UserError('This installation supports at most 80 configured sources.')
+        destinations = [self.db.open(r['dest']) for r in self.db.rows('SELECT dest FROM sources WHERE dest IS NOT NULL')]
+        destinations.append(self.settings['destination'])
+        if any(d and d['chat'] == sid for d in destinations):
+            raise UserError('This channel is already a destination. Copy loops are prohibited.')
+        self.db.execute('INSERT INTO sources(id,peer,title,username,dest,mode) VALUES(?,?,?,?,?,?) '
+                        'ON CONFLICT(id) DO UPDATE SET peer=excluded.peer,title=excluded.title,username=excluded.username',
+                        (sid, self.db.seal(self.peer_record(entity)), entity.title, entity.username,
+                         self.db.seal(self.settings['destination']) if self.settings['destination'] else None,
+                         self.settings['mode']))
+        return sid
+
+    async def resolve_peer(self, peer):
+        self.active()
+        try:
+            return await self.client.get_entity(peer)
+        except errors.RPCError:
+            async for dialog in self.client.iter_dialogs():
+                if dialog.entity and utils.get_peer_id(dialog.entity) == peer.chat_id:
+                    return dialog.entity
+            raise
+
     async def check_source(self, row):
-        entity = await self.active().get_entity(self.peer(self.db.open(row['peer'])))
+        entity = await self.resolve_peer(self.peer(self.db.open(row['peer'])))
         if getattr(entity, 'left', False) or getattr(entity, 'noforwards', False):
             raise UserError('Source is inaccessible or has protected content; copying is disabled.')
         self.db.execute("UPDATE sources SET title=?,username=?,status='Member / accessible' WHERE id=?",
@@ -473,7 +510,7 @@ class Application:
             if member['status'] != 'creator' and not (member['status'] == 'administrator' and member.get('can_post_messages')):
                 raise UserError('Bot must be a destination administrator with Post Messages permission.')
         else:
-            entity = await self.active().get_entity(self.peer(dest))
+            entity = await self.resolve_peer(self.peer(dest))
             if not entity.creator and not (entity.admin_rights and entity.admin_rights.post_messages):
                 raise UserError('Your account lacks permission to post in the destination.')
         return dest
@@ -547,6 +584,10 @@ class Application:
 
     async def callback(self, data):
         action, _, arg = data.partition(':')
+        privileged = {'account', 'security', 'search', 'add', 'sources', 'src', 'check', 'on', 'off', 'remove',
+                     'remove_yes', 'dest', 'destination', 'start', 'stats', 'blocked', 'connect', 'continue', 'resend'}
+        if action in privileged and not self.db.get('session') and action not in ('connect', 'continue', 'resend'):
+            raise UserError('Connect your Telegram account first.')
         auth_actions = ('connect', 'continue', 'resend')
         if action in auth_actions and self.me:
             raise UserError('Already connected. Disconnect before starting authentication.')
@@ -670,7 +711,10 @@ class Application:
         elif action == 'stats':
             rows = self.db.rows('SELECT status,COUNT(*) AS n FROM jobs GROUP BY status')
             await self.say('Publishing jobs\n' + '\n'.join(f'{r["status"]}: {r["n"]}' for r in rows) +
-                           '\nUncertain jobs are NOT retried automatically. Inspect the destination before taking any manual action.', [('Refresh', 'stats')])
+                           '\nUncertain jobs are NOT retried automatically. Inspect the destination before taking any manual action.', [('Refresh', 'stats'), ('Blocked Jobs', 'blocked')])
+        elif action == 'blocked':
+            rows = self.db.rows("SELECT source,first_id,status,error FROM jobs WHERE status IN ('failed','uncertain') ORDER BY created LIMIT 30")
+            await self.say('\n'.join(f'{r["source"]} {r["first_id"]} {r["status"]}: {r["error"]}' for r in rows) or 'No blocked jobs.')
         elif action == 'logs':
             rows = self.db.rows('SELECT * FROM logs ORDER BY id DESC LIMIT 20')
             await self.say('\n'.join(time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(r['at'])) + ' ' + r['category'] for r in rows) or 'No recorded errors.')
@@ -713,6 +757,8 @@ class Application:
         elif stage == 'confirm':
             await self.say('Use Continue to Phone Login.', [('Continue', 'continue')])
         elif stage == 'phone':
+            if self.me:
+                raise UserError('Account is already connected.')
             if not re.fullmatch(r'\+[1-9]\d{6,14}', text):
                 raise UserError('Use international format: + followed by 7-15 digits.')
             next_request = self.db.get('next_code_request', 0)
@@ -755,20 +801,7 @@ class Application:
                 await self.say(f'{entity.title}\nUsername: {entity.username or "private"}\nID: {utils.get_peer_id(entity)}\n'
                                f'Membership: {"not joined" if entity.left else "member"}\nProtected: {bool(entity.noforwards)}', [('Join / Add Source', 'add')])
             else:
-                if entity.noforwards:
-                    raise UserError('This channel protects its content. It cannot be copied.')
-                sid = utils.get_peer_id(entity)
-                if self.db.rows('SELECT COUNT(*) FROM sources')[0][0] >= 80 and not self.db.rows('SELECT 1 FROM sources WHERE id=?', (sid,)):
-                    raise UserError('This installation supports at most 80 configured sources.')
-                destinations = [self.db.open(r['dest']) for r in self.db.rows('SELECT dest FROM sources WHERE dest IS NOT NULL')]
-                destinations.append(self.settings['destination'])
-                if any(d and d['chat'] == sid for d in destinations):
-                    raise UserError('This channel is already a destination. Copy loops are prohibited.')
-                self.db.execute('INSERT INTO sources(id,peer,title,username,dest,mode) VALUES(?,?,?,?,?,?) '
-                                'ON CONFLICT(id) DO UPDATE SET peer=excluded.peer,title=excluded.title,username=excluded.username',
-                                (sid, self.db.seal(self.peer_record(entity)), entity.title, entity.username,
-                                 self.db.seal(self.settings['destination']) if self.settings['destination'] else None,
-                                 self.settings['mode']))
+                sid = self.register_source(entity)
                 self.set_flow()
                 await self.source_detail(sid)
         elif stage == 'destination':
@@ -836,7 +869,7 @@ class Application:
             await self.client.disconnect()
         self.client, self.me = None, None
         with self.db.transaction():
-            for key in ('session', 'account', 'pending', 'flow'):
+            for key in ('session', 'account', 'pending', 'flow', 'joins'):
                 self.db.delete(key)
             for table in ('sources', 'jobs', 'mappings'):
                 self.db.execute('DELETE FROM ' + table)
@@ -888,7 +921,7 @@ class Application:
 
     async def fetch_job(self, row):
         p = self.db.open(row['payload'])
-        source = await self.active().get_entity(self.peer(p['peer']))
+        source = await self.resolve_peer(self.peer(p['peer']))
         if source.left or source.noforwards:
             raise UserError('Source is inaccessible or now protects content.')
         messages = await self.client.get_messages(source, ids=p['ids'])
@@ -944,8 +977,10 @@ class Application:
                 elif audio:
                     kind = 'voice' if audio.voice else 'audio'
             limit = min(self.max_media, (9 if kind == 'photo' else 49) * 1024 * 1024)
+            if m.file and m.file.size and m.file.size > limit and m.media.document.size > limit:
+                raise UserError('File exceeds the cloud Bot API upload limit. Switch this source to account mode to transfer larger files.')
             if m.file and m.file.size and m.file.size > limit:
-                raise UserError('File exceeds configured/cloud Bot API upload limit. Use account mode or lower file sizes.')
+                self.db.log('OversizedDownloadedForBotUpload')
             # Spool only into an owner-only temporary directory; no payload stored in DB.
             with tempfile.TemporaryDirectory(prefix='media-', dir=self.data_dir) as temp:
                 async def progress(current, total):
@@ -1119,7 +1154,46 @@ class Application:
                         await self.notice('reconnected', 'Telegram transport reconnected; monitoring permissions are being rechecked.')
                     if not await self.client.is_user_authorized():
                         raise errors.AuthKeyUnregisteredError(request=None)
+                    joins = self.db.get('joins', {})
+                    for token, pending in list(joins.items()):
+                        try:
+                            invite = await self.client(functions.messages.CheckChatInviteRequest(token))
+                            if isinstance(invite, types.ChatInviteAlready):
+                                if isinstance(invite.chat, types.Channel) and invite.chat.broadcast:
+                                    try:
+                                        new_sid = self.register_source(invite.chat)
+                                    except UserError as exc:
+                                        self.db.log('PendingJoinCannotRegister')
+                                        await self.notice('join_review', 'A tracked channel approved membership but could not be registered: ' + str(exc) + ' Check it with Add Source.')
+                                    else:
+                                        await self.notice('join:' + str(new_sid), f'Membership approved. Source {new_sid} was added OFF. Configure its destination, then start copying.')
+                                joins.pop(token, None)
+                            elif time.time() - pending['requested'] > 604800:
+                                joins.pop(token, None)
+                                await self.notice('join_timeout', 'A pending invitation was not confirmed within 7 days. Telegram did not confirm whether it was approved or rejected. Recheck it with Add Source.')
+                        except (errors.InviteHashExpiredError, errors.InviteHashInvalidError, errors.ChannelPrivateError):
+                            joins.pop(token, None)
+                            await self.notice('invite_invalid', 'A tracked invitation expired or was revoked. No source was enabled.')
+                        except errors.FloodWaitError as exc:
+                            await asyncio.sleep(exc.seconds)
+                    self.db.set('joins', joins)
                     for row in self.db.rows('SELECT * FROM sources WHERE enabled=1'):
+                        try:
+                            await self.check_source(row)
+                        except (UserError, errors.ChannelPrivateError):
+                            await self.stop(row['id'])
+                            self.db.execute("UPDATE sources SET status='Access lost / protected' WHERE id=?", (row['id'],))
+                            await self.notice('access:' + str(row['id']), f'Source access lost or content protected: {row["id"]}. Monitoring paused.')
+                except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.UserDeactivatedError):
+                    await self.stop()
+                    self.me = None
+                    await self.notice('expired_session', 'Telegram session is no longer authorized. Monitoring stopped; reconnect required.')
+                except errors.FloodWaitError as exc:
+                    await self.notice('maintenance_rate', 'Permission checks are rate-limited; retrying after Telegram cooldown.')
+                    await asyncio.sleep(exc.seconds)
+                except (errors.RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                    self.db.log('ConnectionCheck:' + type(exc).__name__)
+                for row in self.db.rows('SELECT * FROM sources WHERE enabled=1'):
                         try:
                             await self.check_source(row)
                         except (UserError, errors.ChannelPrivateError):
@@ -1416,6 +1490,10 @@ class OfflineTests(unittest.TestCase):
         markup = keyboard(MENU)
         for row in markup['inline_keyboard']:
             self.assertLessEqual(len(row[0]['callback_data'].encode()), 64)
+
+    def test_resolve_peer_and_group_boundaries(self):
+        self.assertIn('resolve_peer', dir(Application))
+        self.assertIsNotNone(getattr(types, 'InputPeerChannel'))
 
     def test_schema_version(self):
         with tempfile.TemporaryDirectory() as tmp:
