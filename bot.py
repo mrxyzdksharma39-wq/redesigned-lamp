@@ -1563,7 +1563,14 @@ if __name__ == '__main__':
         asyncio.run(main(terminal_login=args.login))
     except KeyboardInterrupt:
         pass
+    except RuntimeError as exc:
+        # Every RuntimeError this app raises itself uses a static, secret-free
+        # message (bad OWNER_ID/BOT_TOKEN, stale instance lock, wrong key,
+        # existing webhook, etc.), so it's safe and far more useful to log it.
+        LOG.critical('Application stopped: %s', exc)
+        sys.exit(1)
     except Exception as exc:
-        # Do not print traceback/exception messages, which can contain secrets.
+        # Everything else may originate from a library and could echo
+        # request data (tokens, etc.) in its message, so only the type is logged.
         LOG.critical('Application stopped: %s. Check configuration and controlled error logs.', type(exc).__name__)
         sys.exit(1)
