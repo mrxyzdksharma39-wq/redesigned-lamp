@@ -1,0 +1,9 @@
+aiogram>=3.13,<4
+telethon>=1.36,<2
+aiohttp>=3.9
+SQLAlchemy[asyncio]>=2.0.25,<2.1
+asyncpg>=0.29
+aiosqlite>=0.19
+cryptography>=42
+python-dotenv>=1.0
+qrcode[pil]>=7.4
