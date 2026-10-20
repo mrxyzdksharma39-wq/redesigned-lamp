@@ -1193,22 +1193,6 @@ class Application:
                     await asyncio.sleep(exc.seconds)
                 except (errors.RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
                     self.db.log('ConnectionCheck:' + type(exc).__name__)
-                for row in self.db.rows('SELECT * FROM sources WHERE enabled=1'):
-                        try:
-                            await self.check_source(row)
-                        except (UserError, errors.ChannelPrivateError):
-                            await self.stop(row['id'])
-                            self.db.execute("UPDATE sources SET status='Access lost / protected' WHERE id=?", (row['id'],))
-                            await self.notice('access:' + str(row['id']), f'Source access lost or content protected: {row["id"]}. Monitoring paused.')
-                except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.UserDeactivatedError):
-                    await self.stop()
-                    self.me = None
-                    await self.notice('expired_session', 'Telegram session is no longer authorized. Monitoring stopped; reconnect required.')
-                except errors.FloodWaitError as exc:
-                    await self.notice('maintenance_rate', 'Permission checks are rate-limited; retrying after Telegram cooldown.')
-                    await asyncio.sleep(exc.seconds)
-                except (errors.RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
-                    self.db.log('ConnectionCheck:' + type(exc).__name__)
             # Keep processed history for deduplication; no automatic destructive pruning.
 
     async def handle_update(self, update):
@@ -1373,13 +1357,6 @@ class Application:
         await self.resume()
         if self.db.rows("SELECT 1 FROM jobs WHERE status='uncertain' LIMIT 1"):
             await self.notice('uncertain', 'A previous publication has an unknown result. Inspect /blocked and the destination; these jobs are not retried automatically.')
-        server = None
-        if os.getenv('PORT'):
-            site_app = web.Application()
-            site_app.router.add_get('/healthz', self.health)
-            server = web.AppRunner(site_app, access_log=None)
-            await server.setup()
-            await web.TCPSite(server, '0.0.0.0', int(os.environ['PORT'])).start()
         self.ready = True
         self.tasks = [asyncio.create_task(self.poll()), asyncio.create_task(self.worker()),
                       asyncio.create_task(self.maintenance())]
@@ -1405,8 +1382,6 @@ class Application:
             await asyncio.gather(stopper, return_exceptions=True)
             if self.client:
                 await self.client.disconnect()
-            if server:
-                await server.cleanup()
 
 
 class OfflineTests(unittest.TestCase):
@@ -1505,43 +1480,71 @@ class OfflineTests(unittest.TestCase):
 async def main(terminal_login=False):
     load_dotenv()
     os.umask(0o077)
-    owner = int(os.environ['OWNER_ID'])
-    if owner <= 0:
-        raise RuntimeError('OWNER_ID must be a positive numeric Telegram user ID')
-    token = os.environ['BOT_TOKEN']
-    if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', token):
-        raise RuntimeError('BOT_TOKEN format is invalid')
-    key = os.environ['ENCRYPTION_KEY'].encode()
-    Fernet(key)  # Fail closed; never silently generate/replace an existing key.
-    directory = Path(os.getenv('DATA_DIR', './data')).resolve()
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(directory, 0o700)
-    # Linux/Render lock is held for process lifetime, before polling or migrations.
-    import fcntl
-    with open(directory / 'instance.lock', 'a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError('Another instance holds this data directory') from None
-        # A killed process may leave partial downloads; none are needed for recovery.
-        import shutil
-        for path in directory.glob('media-*'):
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-        db = Store(directory / 'copier.sqlite3', key)
-        timeout = aiohttp.ClientTimeout(total=90, connect=20)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                app = Application(db, BotAPI(session, token), owner, directory)
-                loop = asyncio.get_running_loop()
-                for sig in (signal.SIGINT, signal.SIGTERM):
-                    loop.add_signal_handler(sig, app.closing.set)
-                if terminal_login:
-                    await app.terminal_login()
-                else:
-                    await app.run()
-        finally:
-            db.close()
+
+    # Bind Render's health port immediately: the very first thing the process
+    # does, before env validation, disk access, or any Telegram call. Render's
+    # deploy-time port scan only needs a listening socket; binding this early
+    # means the scan succeeds even if everything below is slow or misconfigured,
+    # instead of looping on "No open ports detected" while startup is still in
+    # progress (or crash-looping before it ever reaches a bind).
+    port = os.getenv('PORT')
+    server = None
+    health_ref = {'app': None}
+    if port:
+        async def health_handler(request):
+            app = health_ref['app']
+            if app is None:
+                return web.json_response({'status': 'starting'}, status=503)
+            return await app.health(request)
+        site_app = web.Application()
+        site_app.router.add_get('/healthz', health_handler)
+        server = web.AppRunner(site_app, access_log=None)
+        await server.setup()
+        await web.TCPSite(server, '0.0.0.0', int(port)).start()
+        LOG.info('Health endpoint listening on port %s', port)
+
+    try:
+        owner = int(os.environ['OWNER_ID'])
+        if owner <= 0:
+            raise RuntimeError('OWNER_ID must be a positive numeric Telegram user ID')
+        token = os.environ['BOT_TOKEN']
+        if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', token):
+            raise RuntimeError('BOT_TOKEN format is invalid')
+        key = os.environ['ENCRYPTION_KEY'].encode()
+        Fernet(key)  # Fail closed; never silently generate/replace an existing key.
+        directory = Path(os.getenv('DATA_DIR', './data')).resolve()
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        # Linux/Render lock is held for process lifetime, before polling or migrations.
+        import fcntl
+        with open(directory / 'instance.lock', 'a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('Another instance holds this data directory') from None
+            # A killed process may leave partial downloads; none are needed for recovery.
+            import shutil
+            for path in directory.glob('media-*'):
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+            db = Store(directory / 'copier.sqlite3', key)
+            timeout = aiohttp.ClientTimeout(total=90, connect=20)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    app = Application(db, BotAPI(session, token), owner, directory)
+                    health_ref['app'] = app
+                    loop = asyncio.get_running_loop()
+                    for sig in (signal.SIGINT, signal.SIGTERM):
+                        loop.add_signal_handler(sig, app.closing.set)
+                    if terminal_login:
+                        await app.terminal_login()
+                    else:
+                        await app.run()
+            finally:
+                db.close()
+    finally:
+        if server:
+            await server.cleanup()
 
 
 if __name__ == '__main__':
