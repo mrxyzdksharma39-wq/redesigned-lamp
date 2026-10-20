@@ -1353,7 +1353,11 @@ class Application:
         self.bot_id = me['id']
         webhook = await self.bot.call('getWebhookInfo')
         if webhook.get('url'):
-            raise RuntimeError('ExistingWebhookMustBeRemovedBeforePolling')
+            # This app only runs in polling mode; a leftover webhook (set by an
+            # earlier deploy, a test curl, BotFather, etc.) just blocks getUpdates
+            # forever on every restart. Clear it instead of crash-looping on it.
+            await self.bot.call('deleteWebhook', {'drop_pending_updates': False})
+            self.db.log('ClearedExistingWebhookBeforePolling')
         await self.resume()
         if self.db.rows("SELECT 1 FROM jobs WHERE status='uncertain' LIMIT 1"):
             await self.notice('uncertain', 'A previous publication has an unknown result. Inspect /blocked and the destination; these jobs are not retried automatically.')
